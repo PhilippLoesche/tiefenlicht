@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>Tiefenlicht - Audio-Test</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0e0c0a; color:#d9cdb4; font:14px/1.4 ui-monospace, Menlo, Consolas, monospace; margin:0; padding:20px 24px; }
+  h1 { font-size:18px; color:#f0b45a; margin:0 0 4px; }
+  h2 { font-size:13px; color:#9a8a6a; text-transform:uppercase; letter-spacing:.1em; margin:22px 0 8px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap:6px; }
+  button, select { background:#1d1914; color:#e6d9bd; border:1px solid #3a3226; border-radius:3px; padding:6px 10px; font:inherit; cursor:pointer; }
+  button:hover, select:hover { border-color:#f0b45a; }
+  button:active { background:#3a2c14; }
+  label { display:flex; gap:8px; align-items:center; }
+  input[type=range] { accent-color:#f0b45a; }
+  table { border-collapse:collapse; margin-top:8px; }
+  th, td { padding:3px 12px; text-align:right; border-bottom:1px solid #26211a; }
+  th:first-child, td:first-child { text-align:left; }
+  .bad { color:#ff6b5a; } .ok { color:#8fc77a; }
+  #meter { width:200px; height:8px; background:#1d1914; border:1px solid #3a3226; }
+  #meter div { height:100%; width:0; background:#f0b45a; }
+  #log { color:#9a8a6a; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Tiefenlicht - Audio-Test</h1>
+<div id="status">Audio noch nicht gestartet (erster Klick startet den AudioContext).</div>
+
+<h2>Steuerung</h2>
+<div class="row">
+  <label>Ambience
+    <select id="amb">
+      <option value="">(aus)</option>
+      <option>stollen</option><option>pilzgrotte</option><option>hallen</option><option>herz</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="mute"> stumm</label>
+  <label>Master <input type="range" id="vol" min="0" max="1" step="0.01" value="0.8"></label>
+  <label>Ambience-Lautstaerke <input type="range" id="avol" min="0" max="1" step="0.01" value="0.6"></label>
+  <label>Pitch <input type="range" id="pitch" min="0.5" max="2" step="0.01" value="1"></label>
+  <label>Pan <input type="range" id="pan" min="-1" max="1" step="0.05" value="0"></label>
+  <div id="meter" title="Ausgangspegel"><div></div></div>
+</div>
+
+<h2>Effekte</h2>
+<div class="grid" id="sounds"></div>
+
+<h2>Offline-Pegelpruefung</h2>
+<div class="row"><button id="render">Alle Effekte offline rendern</button><span id="renderState"></span></div>
+<table id="table"></table>
+
+<h2>Log</h2>
+<div id="log"></div>
+
+<script type="module">
+import { audio, SOUND_NAMES, AMBIENT_NAMES } from '../js/audio/index.js';
+window.audio = audio; window.SOUND_NAMES = SOUND_NAMES; window.AMBIENT_NAMES = AMBIENT_NAMES;
+
+const $ = (id) => document.getElementById(id);
+const log = (m) => { $('log').textContent += m + '\n'; };
+window.addEventListener('error', (e) => log('ERROR: ' + e.message));
+window.addEventListener('unhandledrejection', (e) => log('REJECTION: ' + e.reason));
+
+const ensure = async () => {
+  const ok = await audio.init();
+  $('status').textContent = 'AudioContext: ' + audio._debugState().ctx;
+  return ok;
+};
+
+for (const name of SOUND_NAMES) {
+  const b = document.createElement('button');
+  b.textContent = name;
+  b.dataset.sound = name;
+  b.addEventListener('click', async () => {
+    await ensure();
+    audio.play(name, { pitch: +$('pitch').value, pan: +$('pan').value });
+  });
+  $('sounds').append(b);
+}
+
+$('amb').addEventListener('change', async (e) => { await ensure(); audio.setAmbient(e.target.value || null); });
+$('mute').addEventListener('change', (e) => audio.setMuted(e.target.checked));
+$('vol').addEventListener('input', (e) => audio.setVolume(+e.target.value));
+$('avol').addEventListener('input', (e) => audio.setAmbientVolume(+e.target.value));
+
+// level meter
+setInterval(() => {
+  const l = audio._debugLevel();
+  if (l) $('meter').firstElementChild.style.width = Math.min(100, l.peak * 100) + '%';
+}, 50);
+
+const fmt = (x, n = 3) => (Number.isFinite(x) ? x.toFixed(n) : '-inf');
+async function renderAll() {
+  $('renderState').textContent = 'rendert ...';
+  const rows = [];
+  for (const name of SOUND_NAMES) rows.push(await audio._debugRender(name));
+  window.__renderRows = rows;
+  const t = $('table');
+  t.innerHTML = '<tr><th>name</th><th>peak</th><th>peak dB</th><th>rms</th><th>rms dB</th><th>dur s</th><th>dur dry s</th><th>check</th></tr>';
+  for (const r of rows) {
+    const issues = [];
+    if (!(r.peak > 0.01)) issues.push('silent');
+    if (!(r.peak < 1)) issues.push('clips');
+    if (r.dryDuration < 0.05 || r.dryDuration > 1.6) issues.push('dry duration');
+    if (r.duration > 2.5) issues.push('long tail');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${r.name}</td><td>${fmt(r.peak)}</td><td>${fmt(r.peakDb, 1)}</td><td>${fmt(r.rms, 4)}</td><td>${fmt(r.rmsDb, 1)}</td><td>${fmt(r.duration, 2)}</td><td>${fmt(r.dryDuration, 2)}</td><td class="${issues.length ? 'bad' : 'ok'}">${issues.join(', ') || 'ok'}</td>`;
+    t.append(tr);
+  }
+  $('renderState').textContent = 'fertig';
+}
+$('render').addEventListener('click', renderAll);
+window.renderAll = renderAll;
+</script>
+</body>
+</html>
