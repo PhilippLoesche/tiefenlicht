@@ -5,7 +5,12 @@
 import { BIOMES, LIGHT, MASK, getTileCanvas, getSpriteCanvas, clearCache } from '../art/index.js';
 
 const S = 2; // light samples per tile and axis
+// Headroom: everything drawn under the light map is pre-brightened by K and the light map is divided by K,
+// so the lamp pool can exceed the art's base brightness with a single multiply pass (no extra dodge pass).
+const K = 1.5;
 const VS = 4; // void mask samples per tile and axis
+const MIN_TS = 24, MAX_TS = 72;
+export const TILE_LIMITS = [MIN_TS, MAX_TS];
 const ANIM_TILES = new Set(['brazier_lit', 'fungus']);
 const FONT_UI = '"Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif';
 
@@ -30,23 +35,6 @@ function glowTexture(hex, size = 128) {
     gr.addColorStop(t, `rgba(${r},${gg},${b},${a.toFixed(3)})`);
   }
   g.fillStyle = gr; g.fillRect(0, 0, size, size);
-  return c;
-}
-
-/** Screen vignette with per-pixel dither (no banding in the dark), rendered once per viewport size. */
-function vignetteCanvas(W, H) {
-  const c = makeCanvas(W, H), g = c.getContext('2d');
-  const d = g.createImageData(W, H), p = d.data;
-  const cx = W / 2, cy = H / 2, big = Math.hypot(W, H) / 2, r0 = big * 0.45, r1 = big * 1.05;
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const t = (Math.hypot(x - cx, y - cy) - r0) / (r1 - r0);
-      const a = t <= 0 ? 0 : (t >= 1 ? 1 : t * t * (3 - 2 * t)) * 0.8 * 255 + (Math.random() - 0.5) * 2.2;
-      const o = (y * W + x) * 4;
-      p[o] = 4; p[o + 1] = 5; p[o + 2] = 10; p[o + 3] = a;
-    }
-  }
-  g.putImageData(d, 0, 0);
   return c;
 }
 
@@ -81,12 +69,19 @@ export class Renderer {
     this.dimming = 0;           // 0..1 extra darkness (death)
     this.lv = null;
     this.desat = new WeakMap();
+    this.brightMap = new WeakMap();
+    this.maxDpr = 2;            // backing store cap (phones report 3); lowered adaptively when frames run long
+    this.pz = 1;                // live pinch scale on top of the cached tile size
+    this.cts = 48;              // cached tile size in device px (integer)
+    this.dirty = true;          // something changed: draw the next frame even when idle
+    this.lastRender = 0;
+    this.fading = false;
+    this.vigEl = opts.vignette || null;
+    this.vigOpacity = -1;
     this.shadeF = new WeakMap(); this.shadeT = new WeakMap();
     this.white = new WeakMap();
     this.lc = makeCanvas(1, 1);
     this.lctx = this.lc.getContext('2d');
-    this.bc = makeCanvas(1, 1);           // lamp boost map (colour-dodge): lets the lantern pool exceed the art's base brightness
-    this.bctx = this.bc.getContext('2d');
     this.glow = { lamp: glowTexture(LIGHT.lamp), brazier: glowTexture(LIGHT.brazier), fungus: glowTexture(LIGHT.fungus), sun: glowTexture(LIGHT.sunshard), ghost: glowTexture(LIGHT.ghost), corona: glowTexture(LIGHT.corona) };
     this.ents = [];             // reusable draw list
     this.lastT = 0;
@@ -96,24 +91,33 @@ export class Renderer {
 
   // ------------------------------------------------------------ setup
   setTileSize(ts) {
-    if (ts === this.ts && this.tsd === Math.round(ts * this.dpr)) return;
+    ts = Math.max(MIN_TS, Math.min(MAX_TS, Math.round(ts)));
+    this.dirty = true;
+    if (ts === this.ts && this.cts === Math.round(ts * this.dpr)) { this.pz = 1; this.tsd = this.cts; return; }
     this.ts = ts;
-    this.tsd = Math.round(ts * this.dpr);
-    clearCache();
+    this.cts = this.tsd = Math.round(ts * this.dpr);
+    this.pz = 1;
+    clearCache(); // old sizes are dropped, so the art caches never grow across zoom levels
     this.lv = null; // force tile canvas rebuild
     if (this.game) this.sync();
   }
 
+  setMaxDpr(v) {
+    if (v === this.maxDpr) return;
+    this.maxDpr = v;
+    this.resize();
+  }
+
   resize() {
-    const dpr = Math.min(3, window.devicePixelRatio || 1);
+    const dpr = Math.min(this.maxDpr, window.devicePixelRatio || 1);
     const w = this.canvas.clientWidth || window.innerWidth, h = this.canvas.clientHeight || window.innerHeight;
     const W = Math.max(1, Math.round(w * dpr)), H = Math.max(1, Math.round(h * dpr));
-    if (dpr !== this.dpr) { this.dpr = dpr; this.tsd = Math.round(this.ts * dpr); clearCache(); this.lv = null; }
+    if (dpr !== this.dpr) { this.dpr = dpr; this.cts = this.tsd = Math.round(this.ts * dpr); this.pz = 1; clearCache(); this.lv = null; }
+    this.dirty = true;
     if (this.canvas.width !== W || this.canvas.height !== H) { this.canvas.width = W; this.canvas.height = H; }
     this.vw = W; this.vh = H;
     const ctx = this.ctx;
     const big = Math.hypot(W, H) / 2;
-    this.vigCv = vignetteCanvas(W, H);
     this.hurtGrad = ctx.createRadialGradient(W / 2, H / 2, big * 0.35, W / 2, H / 2, big * 1.02);
     this.hurtGrad.addColorStop(0, 'rgba(226,84,58,0)');
     this.hurtGrad.addColorStop(1, 'rgba(226,84,58,0.85)');
@@ -143,7 +147,8 @@ export class Renderer {
     for (const t of lv.traps) if (!t.hidden) this.trapAt.set(t.y * W + t.x, t.kind);
     // tile canvases for explored tiles
     const isWall = (x, y) => x < 0 || y < 0 || x >= W || y >= H || (lv.memTiles[y * W + x] ?? 'wall') === 'wall';
-    const tsd = this.tsd;
+    const tsd = this.cts;
+    this.dirty = true;
     this.animIdx.length = 0;
     for (let i = 0; i < W * H; i++) {
       this.tf[i] = 1;
@@ -160,11 +165,11 @@ export class Renderer {
         opts = { biome, seed: this.seeds[i], mask, faceSouth: south != null && south !== 'wall', scale: 1 };
         // wall tops sit in shadow; the soft light map turns this into gentle ambient occlusion
         this.tf[i] = opts.faceSouth ? 1 : 0.72;
-        this.tileCv[i] = this.shadedWall(getTileCanvas(kind, tsd, opts), opts.faceSouth);
+        this.tileCv[i] = this.bright(this.shadedWall(getTileCanvas(kind, tsd, opts), opts.faceSouth));
         this.tileKind[i] = kind;
         continue;
       } else opts = { biome, seed: this.seeds[i], scale: 1 };
-      this.tileCv[i] = getTileCanvas(kind, tsd, opts);
+      this.tileCv[i] = this.bright(getTileCanvas(kind, tsd, opts));
       this.tileKind[i] = kind;
     }
     this.updateVoid();
@@ -216,8 +221,7 @@ export class Renderer {
     this.vctx = this.vc.getContext('2d');
     this.vimg = this.vctx.createImageData(W * VS, H * VS);
     this.voidKey = -1;
-    this.bc.width = W * S; this.bc.height = H * S;
-    this.bimg = this.bctx.createImageData(W * S, H * S);
+    this.edge = new Uint8Array(N);   // tiles within the soft explored/never-seen boundary
     const B = BIOMES[lv.biome] || BIOMES.stollen;
     this.amb = rgb(B.ambient);
     const fog = rgb(B.fog);
@@ -278,6 +282,55 @@ export class Renderer {
     return { x: r.left + (this.originX() + x * this.tsd) / this.dpr, y: r.top + (this.originY() + y * this.tsd) / this.dpr, size: this.tsd / this.dpr };
   }
 
+  /** Should the loop draw this frame? Idle scenes redraw at ~20 fps (lamp flicker, animated tiles). */
+  wantsFrame(now) {
+    if (this.dirty || this.demo || !this.game || !this.lv) return true;
+    const A = this.anim;
+    if (A.tweens.size || A.lunges.size || A.flashes.size || A.np || A.floaters.length || A.ghosts.length || A.projectiles.length || A.rings.length || A.pending.length) return true;
+    if (now < A.shakeT0 + A.shakeDur || now < A.flashT0 + A.flashDur || now < A.hurtT0 + A.hurtDur) return true;
+    if (this.fading || this.lightR !== this.lightRTarget || Math.abs(this.gain - this.gainTarget) > 0.003 || Math.abs(this.lampTint - this.lampTintTarget) > 0.003) return true;
+    if (Math.abs(this.focusX - this.focusXTarget) > 0.3 || Math.abs(this.focusY - this.focusYTarget) > 0.3) return true;
+    if (!this.detached && this.hero && (Math.abs(this.camX - this.hero.x) > 0.002 || Math.abs(this.camY - this.hero.y) > 0.002)) return true;
+    if (this.dimming > 0.001 && this.dimming < 0.99) return true;
+    return now - this.lastRender >= 48;
+  }
+
+  // ------------------------------------------------------------ pinch zoom
+  /** Put world tile coordinate (ax, ay) under client point (cx, cy). */
+  camForAnchor(ax, ay, cx, cy) {
+    const r = this.canvas.getBoundingClientRect();
+    const px = (cx - r.left) * this.dpr, py = (cy - r.top) * this.dpr;
+    this.camX = (this.vw / 2 + this.focusX * this.dpr - px + ax * this.tsd) / this.tsd - 0.5;
+    this.camY = (this.vh / 2 + this.focusY * this.dpr - py + ay * this.tsd) / this.tsd - 0.5;
+    this.clampCam();
+    this.dirty = true;
+  }
+  pinchBegin(cx, cy) {
+    if (!this.camInit || !this.lv) return false;
+    this.pinchAnchor = this.tileFloatAtClient(cx, cy);
+    this.pinchBase = this.ts * this.pz;
+    this.detached = true;
+    this.dirty = true;
+    return true;
+  }
+  /** Continuous zoom by `scale` relative to the gesture start; the anchored map point follows (cx, cy). */
+  pinchMove(scale, cx, cy) {
+    if (!this.pinchAnchor) return;
+    const ts = Math.max(MIN_TS, Math.min(MAX_TS, this.pinchBase * scale));
+    this.pz = (ts * this.dpr) / this.cts;
+    this.tsd = this.cts * this.pz;
+    this.camForAnchor(this.pinchAnchor.x, this.pinchAnchor.y, cx, cy);
+  }
+  /** Settle on a crisp tile size (one cache rebuild). Returns the new tile size. */
+  pinchEnd(cx, cy) {
+    if (!this.pinchAnchor) return this.ts;
+    const a = this.tileFloatAtClient(cx, cy);
+    this.pinchAnchor = null;
+    this.setTileSize(this.tsd / this.dpr);
+    this.camForAnchor(a.x, a.y, cx, cy);
+    return this.ts;
+  }
+
   // ------------------------------------------------------------ panning
   /** Move the view by a pointer delta in CSS pixels (1:1 with the pointer). Detaches the camera from the hero. */
   panBy(dx, dy) {
@@ -286,6 +339,7 @@ export class Renderer {
     this.camX -= (dx * this.dpr) / this.tsd;
     this.camY -= (dy * this.dpr) / this.tsd;
     this.clampCam();
+    this.dirty = true;
   }
   /** At most about half a screen of void beyond the map edge. */
   clampCam() {
@@ -297,6 +351,7 @@ export class Renderer {
     if (!this.detached) return false;
     this.detached = false;
     this.camFastUntil = performance.now() + 500;
+    this.dirty = true;
     return true;
   }
   /** Change zoom; while detached, keep the point under the pointer (or the view centre) in place. */
@@ -317,8 +372,10 @@ export class Renderer {
     this.lastT = now;
     this.anim.update(now, dt);
     if (!g || !this.lv) { ctx.fillStyle = '#0b0d14'; ctx.fillRect(0, 0, this.vw, this.vh); return; }
-    const lv = this.lv, W = this.W, H = this.H, tsd = this.tsd, anim = this.anim;
+    const lv = this.lv, W = this.W, H = this.H, tsd = this.tsd, cts = this.cts, pz = this.pz, anim = this.anim;
     const reduced = anim.reduced;
+    this.dirty = false;
+    this.lastRender = now;
 
     // --- hero display position & camera
     const hp = anim.pos(0, this.hero.x, this.hero.y, now);
@@ -354,11 +411,13 @@ export class Renderer {
     // --- visibility fade
     const vk = reduced ? 1 : 1 - Math.exp(-dt / 70);
     const visA = this.visA, vis = lv.visible;
+    let fading = false;
     for (let i = 0, n = W * H; i < n; i++) {
       const tv = vis[i];
       const a = visA[i];
-      if (a !== tv) { const d = tv - a; visA[i] = Math.abs(d) < 0.004 ? tv : a + d * vk; }
+      if (a !== tv) { const d = tv - a; visA[i] = Math.abs(d) < 0.004 ? tv : a + d * vk; fading = true; }
     }
+    this.fading = fading;
 
     // --- background: the biome's ambient darkness (never flat black)
     ctx.globalCompositeOperation = 'source-over';
@@ -373,6 +432,7 @@ export class Renderer {
     const tileCv = this.tileCv;
     for (let y = y0; y <= y1; y++) {
       const row = y * W, py = oy + y * tsd;
+      const pyi = Math.floor(py), phi = Math.floor(py + tsd) - pyi;
       for (let x = x0; x <= x1; x++) {
         const i = row + x;
         let c = tileCv[i];
@@ -380,19 +440,20 @@ export class Renderer {
           if (!lv.explored[i]) continue;
           const kind = this.tileKind[i];
           if (!kind) continue;
-          c = getTileCanvas(kind, tsd, { biome: lv.biome, seed: this.seeds[i], t: vis[i] ? tt : 0, scale: 1 });
+          c = this.bright(getTileCanvas(kind, cts, { biome: lv.biome, seed: this.seeds[i], t: vis[i] ? tt : 0, scale: 1 }));
         }
         if (!vis[i]) c = this.memCanvas(c);
-        ctx.drawImage(c, ox + x * tsd, py);
+        if (pz === 1) ctx.drawImage(c, ox + x * tsd, py);
+        else { const pxi = Math.floor(ox + x * tsd); ctx.drawImage(c, pxi, pyi, Math.floor(ox + (x + 1) * tsd) - pxi, phi); } // live pinch: snapped edges, no seams
       }
     }
 
     // --- items
     for (const it of this.items) {
       if (it.x < x0 || it.x > x1 || it.y < y0 || it.y > y1) continue;
-      const c = getSpriteCanvas(it.v.sprite, tsd, { appearance: it.v.tint || undefined, scale: 1 });
+      const c = this.bright(getSpriteCanvas(it.v.sprite, cts, { appearance: it.v.tint || undefined, scale: 1 }));
       ctx.globalAlpha = it.mem ? 0.75 : 1;
-      ctx.drawImage(c, ox + it.x * tsd, oy + it.y * tsd - (c.overTop || 0) * tsd);
+      this.blit(c, ox + it.x * tsd, oy + it.y * tsd - (c.overTop || 0) * tsd);
     }
     ctx.globalAlpha = 1;
 
@@ -413,36 +474,45 @@ export class Renderer {
     }
     for (const e of ents) {
       let c;
-      if (e.hero) { e.c = getSpriteCanvas('hero', tsd, { t: tt, facing: this.heroFacing, scale: 1 }); continue; } // drawn after the light pass
-      if (e.ghost) c = getSpriteCanvas(e.ghost.id, tsd, { t: 0, facing: e.ghost.facing, scale: 1 });
+      if (e.hero) { e.c = getSpriteCanvas('hero', cts, { t: tt, facing: this.heroFacing, scale: 1 }); continue; } // drawn after the light pass
+      if (e.ghost) c = getSpriteCanvas(e.ghost.id, cts, { t: 0, facing: e.ghost.facing, scale: 1 });
       else {
         const m = e.m;
-        c = getSpriteCanvas(m.id, tsd, { t: tt, facing: hx < m.x - 0.01 ? -1 : 1, dormant: m.ai === 'dormant', scale: 1 });
+        c = getSpriteCanvas(m.id, cts, { t: tt, facing: hx < m.x - 0.01 ? -1 : 1, dormant: m.ai === 'dormant', scale: 1 });
       }
       e.c = c;
       const sx = ox + e.x * tsd, sy = oy + e.y * tsd - (c.overTop || 0) * tsd;
       const a = (c.alpha || 1) * (e.ghost ? e.a : 1);
       if (a !== 1) ctx.globalAlpha = a;
-      ctx.drawImage(c, sx, sy);
+      this.blit(this.bright(c), sx, sy);
       if (a !== 1) ctx.globalAlpha = 1;
     }
 
     // --- light map
     this.computeLight(now, hx, hy);
+    // one multiply pass, clipped to the visible tiles (the only full-screen blend per frame)
     ctx.globalCompositeOperation = 'multiply';
     ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(this.lc, ox, oy, W * tsd, H * tsd);
-    // lamp boost, limited to the lamp's reach
-    const reach = Math.ceil(this.lightR + 2);
-    const bx0 = Math.max(0, Math.floor(hx) - reach), by0 = Math.max(0, Math.floor(hy) - reach);
-    const bx1 = Math.min(W, Math.floor(hx) + reach + 1), by1 = Math.min(H, Math.floor(hy) + reach + 1);
-    if (bx1 > bx0 && by1 > by0 && this.lightR > 0.3) {
-      ctx.globalCompositeOperation = 'color-dodge';
-      ctx.drawImage(this.bc, bx0 * S, by0 * S, (bx1 - bx0) * S, (by1 - by0) * S, ox + bx0 * tsd, oy + by0 * tsd, (bx1 - bx0) * tsd, (by1 - by0) * tsd);
+    ctx.imageSmoothingQuality = 'low';
+    {
+      const lx0 = Math.max(0, x0 - 1), ly0 = Math.max(0, y0 - 1), lx1 = Math.min(W, x1 + 2), ly1 = Math.min(H, y1 + 2);
+      ctx.drawImage(this.lc, lx0 * S, ly0 * S, (lx1 - lx0) * S, (ly1 - ly0) * S, ox + lx0 * tsd, oy + ly0 * tsd, (lx1 - lx0) * tsd, (ly1 - ly0) * tsd);
+      // soft edge to the never-seen dark: source-over, only along the boundary (one strip per run of edge tiles)
+      ctx.globalCompositeOperation = 'source-over';
+      const ed = this.edge, vc = this.vc;
+      for (let y = ly0; y < ly1; y++) {
+        const row = y * W;
+        for (let x = lx0; x < lx1; x++) {
+          if (!ed[row + x]) continue;
+          let e2 = x + 1;
+          while (e2 < lx1 && ed[row + e2]) e2++;
+          const dx0 = Math.floor(ox + x * tsd), dy0 = Math.floor(oy + y * tsd);
+          ctx.drawImage(vc, x * VS, y * VS, (e2 - x) * VS, VS, dx0, dy0, Math.floor(ox + e2 * tsd) - dx0, Math.floor(oy + (y + 1) * tsd) - dy0);
+          x = e2;
+        }
+      }
     }
     ctx.globalCompositeOperation = 'source-over';
-    ctx.drawImage(this.vc, ox, oy, W * tsd, H * tsd);
 
     // --- additive glows
     ctx.globalCompositeOperation = 'lighter';
@@ -493,7 +563,7 @@ export class Renderer {
     // --- the lantern bearer is the light: drawn unshaded on top of the light map
     for (const e of ents) {
       if (!e.hero) continue;
-      ctx.drawImage(e.c, ox + e.x * tsd, oy + e.y * tsd - (e.c.overTop || 0) * tsd);
+      this.blit(e.c, ox + e.x * tsd, oy + e.y * tsd - (e.c.overTop || 0) * tsd);
     }
     // --- creature overlays: lift (seen creatures stay readable in dim light), hit flash, health bars, sleep marks
     for (const e of ents) {
@@ -501,14 +571,14 @@ export class Renderer {
       if (!e.hero) {
         const c = e.c;
         ctx.globalAlpha = 0.32 * (c.alpha || 1);
-        ctx.drawImage(c, ox + e.x * tsd, oy + e.y * tsd - (c.overTop || 0) * tsd);
+        this.blit(c, ox + e.x * tsd, oy + e.y * tsd - (c.overTop || 0) * tsd);
         ctx.globalAlpha = 1;
       }
       const uid = e.hero ? 0 : e.m.uid;
       const fa = anim.flashAmount(uid, now);
       if (fa > 0) {
         ctx.globalAlpha = fa * 0.85;
-        ctx.drawImage(this.whiteOf(e.c, e.hero ? '#ffe7c4' : '#ffffff'), ox + e.x * tsd, oy + e.y * tsd - (e.c.overTop || 0) * tsd);
+        this.blit(this.whiteOf(e.c, e.hero ? '#ffe7c4' : '#ffffff'), ox + e.x * tsd, oy + e.y * tsd - (e.c.overTop || 0) * tsd);
         ctx.globalAlpha = 1;
       }
       if (e.hero) continue;
@@ -560,8 +630,8 @@ export class Renderer {
     // --- screen space effects
     ctx.globalAlpha = 1;
     const vig = this.demo ? 1 : 0.55 + this.lampTint * 0.35 + this.dimming * 0.4;
-    ctx.globalAlpha = Math.min(1, vig);
-    ctx.drawImage(this.vigCv, 0, 0);
+    const vo = Math.round(Math.min(1, vig) * 50) / 50;
+    if (vo !== this.vigOpacity && this.vigEl) { this.vigOpacity = vo; this.vigEl.style.opacity = String(vo); }
     let hurt = anim.hurtActive(now);
     if (this.lowHp && !reduced) hurt = Math.max(hurt, 0.12 + 0.1 * Math.sin(now / 420));
     else if (this.lowHp) hurt = Math.max(hurt, 0.14);
@@ -580,12 +650,15 @@ export class Renderer {
     const amb = this.amb, mem = this.memC, al = this.ambLit;
     const sR = this.sR, sG = this.sG, sB = this.sB, tf = this.tf;
     const dim = 1 - this.dimming;
+    // never-seen tiles show the ambient-coloured backdrop untouched (neutral light 1, stored pre-scaled by K);
+    // next to explored tiles the interpolated light darkens it a little, as before
+    const vR = K, vG = K, vB = K;
     for (let i = 0; i < N; i++) {
       const v = visA[i];
       let r, g, b;
       // never-seen tiles are not drawn; the feathered void mask paints them, so they carry the memory value (no bright rim)
+      if (!expl[i]) { bR[i] = vR; bG[i] = vG; bB[i] = vB; lm[i] = 0; continue; }
       r = mem[0]; g = mem[1]; b = mem[2];
-      if (!expl[i]) { bR[i] = r; bG[i] = g; bB[i] = b; lm[i] = 0; continue; }
       const f = tf[i];
       if (v > 0) {
         const lr = (al[0] + sR[i]) * f, lg = (al[1] + sG[i]) * f, lb = (al[2] + sB[i]) * f;
@@ -599,7 +672,7 @@ export class Renderer {
     const R = Math.max(0, this.lightR * (1 + this.flick));
     const gain = this.gain * (1 + this.flick * 1.5) * 1.06;
     const cx = hx + 0.5, cy = hy + 0.5;
-    const data = this.img.data, bd = this.bimg.data;
+    const data = this.img.data, inv = 255 / K;
     const boost = 0.34 * this.gain * (1 - this.dimming);
     const SW = W * S, SH = H * S;
     const rr = (R + 0.5) * (R + 0.5);
@@ -625,6 +698,9 @@ export class Renderer {
         let b = bB[a] * w00 + bB[b2] * w10 + bB[c] * w01 + bB[d] * w11;
         const m = lm[a] * w00 + lm[b2] * w10 + lm[c] * w01 + lm[d] * w11;
         let bo = 0;
+        // never-seen tiles carry a neutral K (they are drawn without headroom), so clamp only what the lamp adds
+        const base = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        const lim = base > 1 ? base : 1;
         if (m > 0.001) {
           const dx = tx - cx;
           const d2 = dx * dx + dy2;
@@ -638,15 +714,18 @@ export class Renderer {
             b += li * (lampB + (C_CORE[2] - lampB) * k);
           }
         }
-        // hue-preserving clamp: bright light keeps its colour instead of burning to white
-        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-        if (mx > 1) { const k = 1 / mx; r *= k; g *= k; b *= k; }
-        data[o] = r * 255; data[o + 1] = g * 255; data[o + 2] = b * 255; data[o + 3] = 255;
-        bd[o] = bo * 255; bd[o + 1] = bo * 214; bd[o + 2] = bo * 150; bd[o + 3] = 255;
+        // hue-preserving clamp at 1, then the lamp boost (what a colour-dodge pass did) uses the K headroom
+        let mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        if (mx > lim) { const k = lim / mx; r *= k; g *= k; b *= k; }
+        if (bo > 0) {
+          r /= 1 - bo; g /= 1 - bo * 0.84; b /= 1 - bo * 0.59;
+          mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+          if (mx > K) { const k = K / mx; r *= k; g *= k; b *= k; }
+        }
+        data[o] = r * inv; data[o + 1] = g * inv; data[o + 2] = b * inv; data[o + 3] = 255;
       }
     }
     this.lctx.putImageData(this.img, 0, 0);
-    this.bctx.putImageData(this.bimg, 0, 0);
   }
 
   /** Feathered mask that paints never-seen space in the ambient darkness, swallowing the explored edge softly. */
@@ -675,6 +754,39 @@ export class Renderer {
       }
     }
     this.vctx.putImageData(this.vimg, 0, 0);
+    // tiles where the mask is neither fully clear nor fully covered by the light map's own darkness
+    const ed = this.edge;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      let mix = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < W && ny < H && ex[ny * W + nx] !== ex[y * W + x]) mix = 1;
+      }
+      ed[y * W + x] = mix;
+    }
+  }
+
+  /** Copy of a canvas with its colour multiplied by K (alpha untouched), for drawing under the light map. */
+  bright(c) {
+    let m = this.brightMap.get(c);
+    if (m) return m;
+    m = makeCanvas(c.width, c.height);
+    const g = m.getContext('2d', { willReadFrequently: true });
+    g.drawImage(c, 0, 0);
+    try {
+      const d = g.getImageData(0, 0, m.width, m.height), p = d.data;
+      for (let i = 0; i < p.length; i += 4) { p[i] *= K; p[i + 1] *= K; p[i + 2] *= K; }
+      g.putImageData(d, 0, 0);
+    } catch { /* keep the plain copy */ }
+    m.overTop = c.overTop; m.alpha = c.alpha;
+    this.brightMap.set(c, m);
+    return m;
+  }
+
+  /** drawImage that follows the live pinch scale. */
+  blit(c, x, y) {
+    if (this.pz === 1) this.ctx.drawImage(c, x, y);
+    else this.ctx.drawImage(c, x, y, c.width * this.pz, c.height * this.pz);
   }
 
   /** Wall tile with its top darkened, so rooms get a clear outline under lamp light. */
@@ -705,8 +817,9 @@ export class Renderer {
       for (let i = 0; i < p.length; i += 4) {
         const l = p[i] * 0.3 + p[i + 1] * 0.55 + p[i + 2] * 0.15;
         // desaturate, and stretch contrast a little so walls and floors stay apart in the dim memory light
-        const L = Math.max(0, (l - 60) * 1.25 + 60);
-        p[i] = L + (p[i] - l) * 0.28; p[i + 1] = L + (p[i + 1] - l) * 0.28; p[i + 2] = L + (p[i + 2] - l) * 0.28 + 6;
+        // (tile canvases arrive pre-brightened by K; the curve is applied in unbrightened units)
+        const L = Math.max(0, (l / K - 60) * 1.25 + 60) * K;
+        p[i] = L + (p[i] - l) * 0.28; p[i + 1] = L + (p[i + 1] - l) * 0.28; p[i + 2] = L + (p[i + 2] - l) * 0.28 + 6 * K;
       }
       g.putImageData(d, 0, 0);
     } catch { /* tainted canvas cannot happen here; keep the copy */ }
@@ -774,7 +887,7 @@ export class Renderer {
       }
       const head = toS(at(k)), tail = toS(at(Math.max(0, k - 0.18)));
       if (p.kind === 'wurfmesser') {
-        const c = getSpriteCanvas('wurfmesser', Math.round(tsd * 0.6), { scale: 1 });
+        const c = getSpriteCanvas('wurfmesser', Math.round(cts * 0.6), { scale: 1 });
         ctx.save();
         ctx.translate(head[0], head[1]);
         ctx.rotate(k * 14);

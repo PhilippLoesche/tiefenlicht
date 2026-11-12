@@ -13,6 +13,8 @@ export class Input {
     this.app = app;
     this.lastWait = 0;
     this.down = null;
+    this.touches = new Map();   // active touch pointers (pinch)
+    this.pinch = null;
     this.wheelAcc = 0;
     this.lastWheel = 0;
     window.addEventListener('keydown', (e) => this.onKey(e));
@@ -25,12 +27,14 @@ export class Input {
     cv.addEventListener('pointerleave', () => { if (!this.down) { this.app.session?.setHover(null); this.app.hud.tooltip(null); } });
     cv.addEventListener('pointerdown', (e) => this.onDown(e));
     cv.addEventListener('pointerup', (e) => this.onUp(e));
-    cv.addEventListener('pointercancel', (e) => this.endDrag(e));
+    cv.addEventListener('pointercancel', (e) => { this.liftTouch(e); if (this.down && this.down.id === e.pointerId) this.endDrag(e); });
     cv.addEventListener('lostpointercapture', (e) => { if (this.down && this.down.id === e.pointerId) this.endDrag(e); });
     // the right button pans; its click action happens on release (see onUp)
     cv.addEventListener('contextmenu', (e) => e.preventDefault());
     cv.addEventListener('auxclick', (e) => e.preventDefault());
     cv.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
+    // ctrl + wheel (trackpad pinch) must never zoom the page while playing
+    window.addEventListener('wheel', (e) => { if (e.ctrlKey && this.inGame() && e.target !== cv) e.preventDefault(); }, { passive: false });
   }
 
   inGame() { return this.app.screen === 'game' && this.app.session; }
@@ -114,6 +118,10 @@ export class Input {
 
   onMove(e) {
     if (!this.inGame()) return;
+    if (e.pointerType !== 'mouse' && this.touches.has(e.pointerId)) {
+      this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this.pinch) { this.updatePinch(); return; }
+    }
     const d = this.down;
     if (d && d.id === e.pointerId) {
       if (!d.panning && Math.hypot(e.clientX - d.x, e.clientY - d.y) > (d.type === 'mouse' ? PAN_THRESHOLD : PAN_THRESHOLD + 4)) this.startPan(d);
@@ -124,6 +132,7 @@ export class Input {
       }
     }
     if (e.pointerType === 'mouse') this.app.setTouch(false);
+    if (d && d.panning) return;
     this.hoverAt(e.clientX, e.clientY, e.pointerType);
   }
 
@@ -139,14 +148,56 @@ export class Input {
 
   onDown(e) {
     this.app.gesture();
-    if (e.pointerType === 'touch' || e.pointerType === 'pen') this.app.setTouch(true);
-    if (!this.inGame() || this.down) return; // a second finger never starts anything
+    const touchLike = e.pointerType === 'touch' || e.pointerType === 'pen';
+    if (touchLike) this.app.setTouch(true);
+    if (!this.inGame()) return;
+    if (e.pointerType === 'touch') {
+      this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      try { this.app.canvas.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+      if (this.touches.size === 2) { this.beginPinch(); return; }
+      if (this.touches.size > 2 || this.pinch) return; // extra fingers never start anything
+    }
+    if (this.down) return;
     if (e.button === 1) e.preventDefault(); // no autoscroll on middle click
     const panNow = e.button === 1 || e.button === 2;
     if (e.button !== 0 && !panNow) return;
     this.down = { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, id: e.pointerId, button: e.button, panning: false, type: e.pointerType };
     try { this.app.canvas.setPointerCapture(e.pointerId); } catch { /* ignore */ }
     if (panNow) this.startPan(this.down);
+  }
+
+  // ---------------------------------------------------------------- two-finger pinch (zoom + pan)
+  pinchState() {
+    const [a, b] = [...this.touches.values()];
+    return { d: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+  }
+  beginPinch() {
+    const s = this.app.session;
+    // whatever the first finger was doing is cancelled: a pinch never ends in a tap
+    if (this.down) { this.down = null; this.app.canvas.style.cursor = ''; }
+    s?.stopAuto();
+    if (s) { s.hoverTile = null; this.app.renderer.hover = null; this.app.renderer.path = null; }
+    this.app.hud.tooltip(null);
+    const p = this.pinchState();
+    if (!this.app.renderer.pinchBegin(p.mx, p.my)) return;
+    this.pinch = { d0: p.d, last: p };
+  }
+  updatePinch() {
+    if (this.touches.size < 2) return;
+    const p = this.pinchState();
+    this.pinch.last = p;
+    this.app.renderer.pinchMove(p.d / this.pinch.d0, p.mx, p.my);
+  }
+  endPinch() {
+    const p = this.pinch.last;
+    this.pinch = null;
+    this.app.zoomSettled(this.app.renderer.pinchEnd(p.mx, p.my));
+    // a finger still down carries on as a pan from where it is (no jump, no tap)
+    const rest = [...this.touches.entries()][0];
+    if (rest) {
+      const [id, t] = rest;
+      this.down = { x: t.x, y: t.y, lx: t.x, ly: t.y, id, button: 0, panning: true, type: 'touch' };
+    }
   }
 
   startPan(d) {
@@ -166,7 +217,16 @@ export class Input {
     return d;
   }
 
+  /** pointerup / pointercancel of a finger: keeps the pinch bookkeeping right. Returns true if consumed. */
+  liftTouch(e) {
+    if (!this.touches.has(e.pointerId)) return false;
+    this.touches.delete(e.pointerId);
+    if (this.pinch) { if (this.touches.size < 2) this.endPinch(); return true; }
+    return false;
+  }
+
   onUp(e) {
+    if (this.liftTouch(e)) return;
     if (!this.down || this.down.id !== e.pointerId) return;
     const d = this.endDrag(e);
     if (!this.inGame()) return;
@@ -181,9 +241,25 @@ export class Input {
     s.clickTile(t.x, t.y);
   }
 
+  /** Trackpad pinch arrives as wheel events with ctrlKey: continuous zoom around the pointer, settled after a pause. */
+  trackpadPinch(e) {
+    const R = this.app.renderer;
+    if (!this.wheelPinch) {
+      if (!R.pinchBegin(e.clientX, e.clientY)) return;
+      this.wheelPinch = { scale: 1 };
+    }
+    const wp = this.wheelPinch;
+    wp.scale *= Math.exp(-(e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY) * 0.01);
+    wp.x = e.clientX; wp.y = e.clientY;
+    R.pinchMove(wp.scale, wp.x, wp.y);
+    clearTimeout(wp.timer);
+    wp.timer = setTimeout(() => { this.wheelPinch = null; this.app.zoomSettled(R.pinchEnd(wp.x, wp.y)); }, 220);
+  }
+
   onWheel(e) {
     if (!this.inGame()) return;
     e.preventDefault();
+    if (e.ctrlKey) { this.trackpadPinch(e); return; }
     const now = performance.now();
     if (now - this.lastWheel > 400) this.wheelAcc = 0;
     this.lastWheel = now;

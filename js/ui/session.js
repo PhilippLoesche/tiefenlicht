@@ -426,12 +426,14 @@ export class Session {
   }
   updateHover() {
     const R = this.renderer, t = this.hoverTile;
+    R.dirty = true;
     if (this.targeting) return;
     const lv = this.state.level;
     if (!t || t.x < 0 || t.y < 0 || t.x >= lv.width || t.y >= lv.height || this.ended) {
       R.hover = null; R.path = null; this.app.hud.tooltip(null); return;
     }
     R.hover = t;
+    R.dirty = true;
     const p = this.state.player;
     const explored = lv.explored[t.y * lv.width + t.x];
     if (explored && !(t.x === p.x && t.y === p.y) && !this.auto) {
@@ -491,6 +493,7 @@ export class Session {
       }
     }
     this.renderer.targeting = { cursor: c, valid, candidates: T.cands, line };
+    this.renderer.dirty = true;
     this.app.hud.targetInfo(T, valid);
   }
 
@@ -535,6 +538,7 @@ export class Session {
     if (!this.targeting) return;
     this.targeting = null;
     this.renderer.targeting = null;
+    this.renderer.dirty = true;
     this.app.hud.targetBanner(null);
     if (!silent) { this.addLog('Du lässt es bleiben.', 'info'); audio.play('ui_close', { volume: 0.5 }); }
     this.updateHover();

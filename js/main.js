@@ -2,7 +2,7 @@
 import { Game } from './engine/index.js';
 import { audio } from './audio/index.js';
 import { Anim } from './ui/anim.js';
-import { Renderer } from './ui/renderer.js';
+import { Renderer, TILE_LIMITS } from './ui/renderer.js';
 import { Session } from './ui/session.js';
 import { Hud } from './ui/hud.js';
 import { Inventory } from './ui/inventory.js';
@@ -13,7 +13,7 @@ import { Title } from './ui/title.js';
 import { h, prefersReducedMotion } from './ui/dom.js';
 import * as store from './ui/storage.js';
 
-const ZOOMS = [24, 28, 32, 40, 48, 56, 64];
+const ZOOMS = [24, 28, 32, 40, 48, 56, 64, 72];
 const params = new URLSearchParams(location.search);
 const DEBUG = params.has('debug');
 
@@ -34,7 +34,8 @@ class App {
 
     const app = document.getElementById('app');
     this.canvas = h('canvas#map', { 'aria-label': 'Spielkarte' });
-    this.renderer = new Renderer(this.canvas, this.anim);
+    this.vignette = h('div.vignette', { 'aria-hidden': 'true' });
+    this.renderer = new Renderer(this.canvas, this.anim, { vignette: this.vignette });
     this.hud = new Hud(this);
     this.inventory = new Inventory(this);
     this.minimap = new Minimap(this);
@@ -45,7 +46,7 @@ class App {
     this.veil = h('div.veil');
     this.hud.topright.append(this.inventory.el);
     this.hud.root.append(this.inventory.scrim);
-    app.replaceChildren(this.canvas, this.hud.root, this.title.el, this.veil, this.floorCard, this.overlays.root);
+    app.replaceChildren(this.canvas, this.vignette, this.hud.root, this.title.el, this.veil, this.floorCard, this.overlays.root);
     this.input = new Input(this);
 
     audio.setMuted(this.settings.muted);
@@ -53,7 +54,8 @@ class App {
     this.hud.setMuted(this.settings.muted);
 
     this.renderer.resize();
-    this.renderer.setTileSize(this.settings.tileSize && ZOOMS.includes(this.settings.tileSize) ? this.settings.tileSize : this.defaultZoom());
+    const ts = +this.settings.tileSize;
+    this.renderer.setTileSize(ts >= TILE_LIMITS[0] && ts <= TILE_LIMITS[1] ? ts : this.defaultZoom());
     window.addEventListener('resize', () => this.onResize());
     this.narrowMq.addEventListener?.('change', (e) => {
       this.narrow = e.matches;
@@ -86,8 +88,30 @@ class App {
     }
     if (this.screen === 'game' && this.session) this.session.tick(now);
     else if (this.screen === 'title') this.title.frame(now);
-    this.renderer.frame(now);
+    // idle scenes redraw at ~20 fps; anything moving (or any input) draws every frame
+    if (this.renderer.wantsFrame(now)) {
+      this.renderer.frame(now);
+      this.watchFrameTime(now);
+    } else this.lastDrawAt = 0;
     if (this.screen === 'game') this.hud.frame(now);
+  }
+
+  /**
+   * Adaptive quality: if consecutive frames keep taking much longer than a 60 Hz frame,
+   * lower the canvas backing-store resolution one step (2 -> 1.5 -> 1 device px per CSS px).
+   */
+  watchFrameTime(now) {
+    if (this.lastDrawAt && !document.hidden) {
+      const iv = now - this.lastDrawAt;
+      if (iv < 250) (this.frameSamples ??= []).push(iv);
+      if (this.frameSamples && this.frameSamples.length >= 90) {
+        const s = this.frameSamples.sort((a, b) => a - b), med = s[s.length >> 1];
+        this.frameSamples = [];
+        const R = this.renderer;
+        if (med > 24 && R.dpr > 1) R.setMaxDpr(Math.max(1, Math.round((R.dpr - 0.5) * 2) / 2));
+      }
+    }
+    this.lastDrawAt = now;
   }
 
   onResize() {
@@ -239,11 +263,16 @@ class App {
     this.saveSettings();
   }
 
+  /** Persist the tile size chosen by pinch / trackpad zoom. */
+  zoomSettled(ts) {
+    this.settings.tileSize = ts;
+    this.saveSettings();
+  }
+
   zoom(d, client) {
     const cur = this.renderer.ts;
-    let i = ZOOMS.indexOf(cur);
-    if (i < 0) i = ZOOMS.findIndex((z) => z >= cur);
-    const n = ZOOMS[Math.max(0, Math.min(ZOOMS.length - 1, i + d))];
+    // next listed step in the wanted direction (pinch may have left an in-between size)
+    const n = d > 0 ? (ZOOMS.find((z) => z > cur) ?? cur) : ([...ZOOMS].reverse().find((z) => z < cur) ?? cur);
     if (n === cur) return;
     this.renderer.zoomAt(n, client);
     this.settings.tileSize = n;
